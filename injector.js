@@ -31,15 +31,23 @@ console.log('🚀 N8N Credential Injector started:', {
   n8nUrl: CONFIG.N8N_URL,
   hasSupabaseConfig: !!(CONFIG.SUPABASE_URL && CONFIG.SUPABASE_SERVICE_KEY),
   hasN8NConfig: !!(CONFIG.N8N_URL && CONFIG.N8N_ENCRYPTION_KEY),
-  hasGoogleOAuth: !!(CONFIG.GOOGLE_OAUTH_CLIENT_ID && CONFIG.GOOGLE_OAUTH_CLIENT_SECRET)
+  hasGoogleOAuth: !!(CONFIG.GOOGLE_OAUTH_CLIENT_ID && CONFIG.GOOGLE_OAUTH_CLIENT_SECRET),
+  allEnvVars: Object.keys(process.env).filter(key => key.startsWith('USER_ID') || key.startsWith('PROVIDER') || key.startsWith('N8N_') || key.startsWith('SUPABASE_'))
 });
 
 // Main execution function
 async function main() {
   try {
+    console.log('🔍 Environment variables check:', {
+      USER_ID: CONFIG.USER_ID ? 'SET' : 'MISSING',
+      PROVIDER: CONFIG.PROVIDER ? 'SET' : 'MISSING',
+      N8N_ENCRYPTION_KEY: CONFIG.N8N_ENCRYPTION_KEY ? 'SET' : 'MISSING',
+      availableEnvVars: Object.keys(process.env).sort()
+    });
+
     // Validate required environment variables
     if (!CONFIG.USER_ID || !CONFIG.PROVIDER) {
-      throw new Error('Missing required parameters: USER_ID and PROVIDER must be set');
+      throw new Error(`Missing required parameters: USER_ID=${CONFIG.USER_ID || 'undefined'}, PROVIDER=${CONFIG.PROVIDER || 'undefined'}`);
     }
 
     if (!CONFIG.SUPABASE_URL || !CONFIG.SUPABASE_SERVICE_KEY) {
