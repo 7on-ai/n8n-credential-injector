@@ -1,0 +1,20 @@
+{
+  "name": "n8n-credential-injector",
+  "version": "3.0.0",
+  "description": "N8N Credential Injector Service for Northflank",
+  "main": "injector.js",
+  "type": "module",
+  "scripts": {
+    "start": "node injector.js",
+    "dev": "node --watch injector.js"
+  },
+  "dependencies": {
+    "@supabase/supabase-js": "^2.38.0"
+  },
+  "engines": {
+    "node": ">=20.19"
+  },
+  "keywords": ["n8n", "cli", "northflank", "credentials", "injector"],
+  "author": "",
+  "license": "MIT"
+}
