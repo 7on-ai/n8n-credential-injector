@@ -1,16 +1,15 @@
-// N8N Credential Injector Service for Northflank
-// This runs as a ManualJob that gets triggered by Edge Functions via Northflank API
+// N8N Credential Injector Service for Northflank - Database Queue Approach
+// This runs as a ManualJob that processes pending credential injections
 
 import { createClient } from '@supabase/supabase-js';
 import { exec } from 'child_process';
 import { promisify } from 'util';
 import fs from 'fs/promises';
-import path from 'path';
 import crypto from 'crypto';
 
 const execAsync = promisify(exec);
 
-// Configuration from environment variables
+// Configuration from environment variables (only fixed values from template)
 const CONFIG = {
   SUPABASE_URL: process.env.SUPABASE_URL,
   SUPABASE_SERVICE_KEY: process.env.SUPABASE_SERVICE_ROLE_KEY,
@@ -18,38 +17,25 @@ const CONFIG = {
   N8N_USER_EMAIL: process.env.N8N_USER_EMAIL,
   N8N_USER_PASSWORD: process.env.N8N_USER_PASSWORD,
   N8N_ENCRYPTION_KEY: process.env.N8N_ENCRYPTION_KEY,
-  USER_ID: process.env.USER_ID,
-  PROVIDER: process.env.PROVIDER,
+  USER_ID: process.env.USER_ID, // From template
   GOOGLE_OAUTH_CLIENT_ID: process.env.GOOGLE_OAUTH_CLIENT_ID,
-  GOOGLE_OAUTH_CLIENT_SECRET: process.env.GOOGLE_OAUTH_CLIENT_SECRET
+  GOOGLE_OAUTH_CLIENT_SECRET: process.env.GOOGLE_OAUTH_CLIENT_SECRET,
+  NORTHFLANK_PROJECT_ID: process.env.NORTHFLANK_PROJECT_ID
 };
 
 console.log('🚀 N8N Credential Injector started:', {
   timestamp: new Date().toISOString(),
-  userId: CONFIG.USER_ID,
-  provider: CONFIG.PROVIDER,
+  templateUserId: CONFIG.USER_ID,
   n8nUrl: CONFIG.N8N_URL,
+  projectId: CONFIG.NORTHFLANK_PROJECT_ID,
   hasSupabaseConfig: !!(CONFIG.SUPABASE_URL && CONFIG.SUPABASE_SERVICE_KEY),
   hasN8NConfig: !!(CONFIG.N8N_URL && CONFIG.N8N_ENCRYPTION_KEY),
-  hasGoogleOAuth: !!(CONFIG.GOOGLE_OAUTH_CLIENT_ID && CONFIG.GOOGLE_OAUTH_CLIENT_SECRET),
-  allEnvVars: Object.keys(process.env).filter(key => key.startsWith('USER_ID') || key.startsWith('PROVIDER') || key.startsWith('N8N_') || key.startsWith('SUPABASE_'))
+  hasGoogleOAuth: !!(CONFIG.GOOGLE_OAUTH_CLIENT_ID && CONFIG.GOOGLE_OAUTH_CLIENT_SECRET)
 });
 
 // Main execution function
 async function main() {
   try {
-    console.log('🔍 Environment variables check:', {
-      USER_ID: CONFIG.USER_ID ? 'SET' : 'MISSING',
-      PROVIDER: CONFIG.PROVIDER ? 'SET' : 'MISSING',
-      N8N_ENCRYPTION_KEY: CONFIG.N8N_ENCRYPTION_KEY ? 'SET' : 'MISSING',
-      availableEnvVars: Object.keys(process.env).sort()
-    });
-
-    // Validate required environment variables
-    if (!CONFIG.USER_ID || !CONFIG.PROVIDER) {
-      throw new Error(`Missing required parameters: USER_ID=${CONFIG.USER_ID || 'undefined'}, PROVIDER=${CONFIG.PROVIDER || 'undefined'}`);
-    }
-
     if (!CONFIG.SUPABASE_URL || !CONFIG.SUPABASE_SERVICE_KEY) {
       throw new Error('Missing Supabase configuration');
     }
@@ -58,24 +44,26 @@ async function main() {
       throw new Error('Missing N8N configuration');
     }
 
-    console.log(`📥 Processing credential injection for user: ${CONFIG.USER_ID}, provider: ${CONFIG.PROVIDER}`);
+    if (!CONFIG.USER_ID) {
+      throw new Error('Missing USER_ID from template');
+    }
+
+    console.log('📥 Processing pending credential injections for user:', CONFIG.USER_ID);
 
     // Initialize Supabase client
     const supabase = createClient(CONFIG.SUPABASE_URL, CONFIG.SUPABASE_SERVICE_KEY);
 
-    // Fetch user credentials from database
-    const credData = await fetchUserCredentials(supabase, CONFIG.USER_ID, CONFIG.PROVIDER);
-    if (!credData) {
-      throw new Error('User credentials not found in database');
+    // Find pending credential injections for this user
+    const pendingCredentials = await findPendingCredentials(supabase, CONFIG.USER_ID);
+    
+    if (!pendingCredentials || pendingCredentials.length === 0) {
+      console.log('ℹ️ No pending credential injections found for this user');
+      process.exit(0);
     }
 
-    console.log('✅ Credentials fetched from database:', {
-      provider: credData.provider,
-      hasAccessToken: !!credData.access_token,
-      hasRefreshToken: !!credData.refresh_token,
-      hasClientCredentials: !!(credData.client_id && credData.client_secret),
-      tokenSource: credData.token_source
-    });
+    console.log(`📋 Found ${pendingCredentials.length} pending credential injections:`, 
+      pendingCredentials.map(c => ({ provider: c.provider, created_at: c.created_at }))
+    );
 
     // Verify n8n CLI is available
     try {
@@ -85,109 +73,108 @@ async function main() {
       throw new Error(`N8N CLI not available: ${error.message}`);
     }
 
-    // Create credential template
-    const credentialTemplate = createCredentialTemplate(credData);
-    const jsonContent = generateCredentialJSON([credentialTemplate]);
+    let successCount = 0;
+    let failureCount = 0;
 
-    console.log('📝 Generated credential template:', {
-      id: credentialTemplate.id,
-      name: credentialTemplate.name,
-      type: credentialTemplate.type
+    // Process each pending credential
+    for (const credentialRecord of pendingCredentials) {
+      try {
+        console.log(`\n🔄 Processing ${credentialRecord.provider} credential...`);
+        
+        // Create credential template
+        const credentialTemplate = createCredentialTemplate(credentialRecord);
+        const jsonContent = generateCredentialJSON([credentialTemplate]);
+
+        console.log('📝 Generated credential template:', {
+          id: credentialTemplate.id,
+          name: credentialTemplate.name,
+          type: credentialTemplate.type,
+          provider: credentialRecord.provider
+        });
+
+        // Execute n8n CLI import
+        const importResult = await executeN8NImport(jsonContent, credentialRecord);
+
+        if (importResult.success) {
+          // Update database with success status
+          await updateCredentialStatus(
+            supabase,
+            CONFIG.USER_ID,
+            credentialRecord.provider,
+            credentialRecord.token_source || 'auth0',
+            true,
+            importResult.credentialId,
+            'Credentials injected successfully via Northflank job',
+            importResult.details
+          );
+
+          console.log(`✅ ${credentialRecord.provider} credential injection completed successfully`);
+          successCount++;
+        } else {
+          throw new Error(importResult.message || 'Import failed');
+        }
+
+      } catch (error) {
+        console.error(`❌ Failed to process ${credentialRecord.provider} credential:`, error);
+        
+        // Update database with error status
+        await updateCredentialStatus(
+          supabase,
+          CONFIG.USER_ID,
+          credentialRecord.provider,
+          credentialRecord.token_source || 'auth0',
+          false,
+          null,
+          error.message,
+          { error_type: 'northflank_job_processing_error' }
+        );
+        
+        failureCount++;
+      }
+    }
+
+    console.log(`\n📊 Processing completed:`, {
+      total: pendingCredentials.length,
+      successful: successCount,
+      failed: failureCount
     });
 
-    // Execute n8n CLI import
-    const importResult = await executeN8NImport(jsonContent, credData);
+    if (successCount > 0) {
+      console.log('✅ Some credentials were successfully injected');
+    }
 
-    if (importResult.success) {
-      // Update database with success status
-      await updateCredentialStatus(
-        supabase,
-        CONFIG.USER_ID,
-        CONFIG.PROVIDER,
-        true,
-        importResult.credentialId,
-        'Credentials injected successfully via Northflank job',
-        importResult.details
-      );
-
-      console.log('✅ Credential injection completed successfully:', {
-        credentialId: importResult.credentialId,
-        method: 'northflank_n8n_cli'
-      });
-
-      process.exit(0);
+    if (failureCount > 0) {
+      console.log('⚠️ Some credentials failed to inject');
+      process.exit(1);
     } else {
-      throw new Error(importResult.message || 'Import failed');
+      process.exit(0);
     }
 
   } catch (error) {
     console.error('❌ Credential injection failed:', error);
-    
-    // Update database with error status
-    if (CONFIG.SUPABASE_URL && CONFIG.SUPABASE_SERVICE_KEY && CONFIG.USER_ID && CONFIG.PROVIDER) {
-      try {
-        const supabase = createClient(CONFIG.SUPABASE_URL, CONFIG.SUPABASE_SERVICE_KEY);
-        await updateCredentialStatus(
-          supabase,
-          CONFIG.USER_ID,
-          CONFIG.PROVIDER,
-          false,
-          null,
-          error.message,
-          { error_type: 'northflank_job_error', timestamp: new Date().toISOString() }
-        );
-      } catch (dbError) {
-        console.error('❌ Failed to update database with error:', dbError);
-      }
-    }
-
     process.exit(1);
   }
 }
 
-// Fetch user credentials from Supabase
-async function fetchUserCredentials(supabase, userId, provider) {
+// Find pending credential injections for user
+async function findPendingCredentials(supabase, userId) {
   try {
     const { data, error } = await supabase
       .from('user_social_credentials')
       .select('*')
       .eq('user_id', userId)
-      .eq('provider', provider)
-      .single();
+      .eq('injected_to_n8n', false)
+      .is('injection_error', null)  // Only get ones that haven't failed yet
+      .order('created_at', { ascending: true });
 
     if (error) {
       console.error('Database query error:', error);
       return null;
     }
 
-    if (!data) {
-      console.error('No credentials found for user and provider');
-      return null;
-    }
-
-    // Validate required fields
-    if (!data.access_token || !data.client_id || !data.client_secret) {
-      console.error('Incomplete credential data:', {
-        hasAccessToken: !!data.access_token,
-        hasClientId: !!data.client_id,
-        hasClientSecret: !!data.client_secret
-      });
-      return null;
-    }
-
-    return {
-      user_id: userId,
-      provider: provider,
-      access_token: data.access_token,
-      refresh_token: data.refresh_token || '',
-      client_id: data.client_id,
-      client_secret: data.client_secret,
-      token_source: data.token_source,
-      n8n_encryption_key: CONFIG.N8N_ENCRYPTION_KEY
-    };
-
+    return data || [];
   } catch (error) {
-    console.error('Error fetching credentials:', error);
+    console.error('Error finding pending credentials:', error);
     return null;
   }
 }
@@ -218,7 +205,7 @@ function createCredentialTemplate(credData) {
       clientId: credData.client_id,
       clientSecret: credData.client_secret,
       accessToken: credData.access_token,
-      refreshToken: credData.refresh_token,
+      refreshToken: credData.refresh_token || '',
       tokenType: 'Bearer',
       grantType: 'authorizationCode'
     },
@@ -301,7 +288,7 @@ async function executeN8NImport(jsonContent, credData) {
         credentialId: credentialId,
         message: 'Credentials imported successfully via N8N CLI',
         details: {
-          method: 'northflank_n8n_cli',
+          method: 'northflank_n8n_cli_queue',
           output: stdout.substring(0, 500), // Limit output size
           provider: credData.provider,
           tokenSource: credData.token_source
@@ -333,7 +320,7 @@ async function executeN8NImport(jsonContent, credData) {
 }
 
 // Update credential status in database
-async function updateCredentialStatus(supabase, userId, provider, success, credentialId, message, details) {
+async function updateCredentialStatus(supabase, userId, provider, tokenSource, success, credentialId, message, details) {
   try {
     const updateData = {
       injected_to_n8n: success,
@@ -341,13 +328,13 @@ async function updateCredentialStatus(supabase, userId, provider, success, crede
       injection_error: success ? null : message,
       injection_attempted_at: new Date().toISOString(),
       additional_data: JSON.stringify({
-        injection_method: 'northflank_n8n_cli',
+        injection_method: 'northflank_n8n_cli_queue',
         success: success,
         error: success ? null : message,
         details: details || {},
         timestamp: new Date().toISOString(),
         platform: 'northflank',
-        version: '3.0'
+        version: '3.1'
       }),
       updated_at: new Date().toISOString()
     };
@@ -357,11 +344,18 @@ async function updateCredentialStatus(supabase, userId, provider, success, crede
       updateData.n8n_credential_ids = JSON.stringify([credentialId]);
     }
 
-    const { error } = await supabase
+    // Use token_source in the where clause to match unique constraint
+    let whereClause = supabase
       .from('user_social_credentials')
       .update(updateData)
       .eq('user_id', userId)
       .eq('provider', provider);
+      
+    if (tokenSource) {
+      whereClause = whereClause.eq('token_source', tokenSource);
+    }
+
+    const { error } = await whereClause;
 
     if (error) {
       console.error('❌ Database update failed:', error);
@@ -371,6 +365,7 @@ async function updateCredentialStatus(supabase, userId, provider, success, crede
     console.log('✅ Database updated successfully:', {
       userId,
       provider,
+      tokenSource,
       success,
       credentialId
     });
