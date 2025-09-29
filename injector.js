@@ -1,14 +1,8 @@
-// N8N Credential Injector Service for Northflank (Database Flag Based)
+// N8N Credential Injector Service for Northflank (Using N8N API)
 // This runs as a ManualJob and processes all credentials with injection_requested=true
 
 import { createClient } from '@supabase/supabase-js';
-import { exec } from 'child_process';
-import { promisify } from 'util';
-import fs from 'fs/promises';
-import path from 'path';
 import crypto from 'crypto';
-
-const execAsync = promisify(exec);
 
 // Configuration from environment variables
 const CONFIG = {
@@ -19,16 +13,21 @@ const CONFIG = {
   N8N_USER_PASSWORD: process.env.N8N_USER_PASSWORD,
   N8N_ENCRYPTION_KEY: process.env.N8N_ENCRYPTION_KEY,
   GOOGLE_OAUTH_CLIENT_ID: process.env.GOOGLE_OAUTH_CLIENT_ID,
-  GOOGLE_OAUTH_CLIENT_SECRET: process.env.GOOGLE_OAUTH_CLIENT_SECRET
+  GOOGLE_OAUTH_CLIENT_SECRET: process.env.GOOGLE_OAUTH_CLIENT_SECRET,
+  DB_POSTGRESDB_HOST: process.env.DB_POSTGRESDB_HOST,
+  DB_POSTGRESDB_PORT: process.env.DB_POSTGRESDB_PORT,
+  DB_POSTGRESDB_DATABASE: process.env.DB_POSTGRESDB_DATABASE,
+  DB_POSTGRESDB_USER: process.env.DB_POSTGRESDB_USER,
+  DB_POSTGRESDB_PASSWORD: process.env.DB_POSTGRESDB_PASSWORD
 };
 
-console.log('🚀 N8N Credential Injector started (Database Flag Based):', {
+console.log('🚀 N8N Credential Injector started (N8N API Based):', {
   timestamp: new Date().toISOString(),
   n8nUrl: CONFIG.N8N_URL,
   hasSupabaseConfig: !!(CONFIG.SUPABASE_URL && CONFIG.SUPABASE_SERVICE_KEY),
   hasN8NConfig: !!(CONFIG.N8N_URL && CONFIG.N8N_ENCRYPTION_KEY),
   hasGoogleOAuth: !!(CONFIG.GOOGLE_OAUTH_CLIENT_ID && CONFIG.GOOGLE_OAUTH_CLIENT_SECRET),
-  method: 'database_flag_based'
+  method: 'n8n_api_direct'
 });
 
 // Main execution function
@@ -38,14 +37,15 @@ async function main() {
       N8N_ENCRYPTION_KEY: CONFIG.N8N_ENCRYPTION_KEY ? 'SET' : 'MISSING',
       SUPABASE_URL: CONFIG.SUPABASE_URL ? 'SET' : 'MISSING',
       SUPABASE_SERVICE_KEY: CONFIG.SUPABASE_SERVICE_KEY ? 'SET' : 'MISSING',
-      method: 'flag_based_processing'
+      N8N_URL: CONFIG.N8N_URL ? 'SET' : 'MISSING',
+      method: 'n8n_api_based_processing'
     });
 
     if (!CONFIG.SUPABASE_URL || !CONFIG.SUPABASE_SERVICE_KEY) {
       throw new Error('Missing Supabase configuration');
     }
 
-    if (!CONFIG.N8N_URL || !CONFIG.N8N_ENCRYPTION_KEY) {
+    if (!CONFIG.N8N_URL || !CONFIG.N8N_USER_EMAIL || !CONFIG.N8N_USER_PASSWORD) {
       throw new Error('Missing N8N configuration');
     }
 
@@ -71,13 +71,10 @@ async function main() {
       }))
     );
 
-    // Verify n8n CLI is available
-    try {
-      const { stdout } = await execAsync('n8n --version', { timeout: 10000 });
-      console.log('✅ N8N CLI available:', stdout.trim());
-    } catch (error) {
-      throw new Error(`N8N CLI not available: ${error.message}`);
-    }
+    // Authenticate with N8N API
+    console.log('🔐 Authenticating with N8N API...');
+    const authToken = await authenticateN8N();
+    console.log('✅ N8N authentication successful');
 
     // Process each credential
     let successCount = 0;
@@ -87,20 +84,16 @@ async function main() {
       try {
         console.log(`🔄 Processing credential for user: ${credData.user_id}, provider: ${credData.provider}`);
         
-        // Create credential template
-        const credentialTemplate = createCredentialTemplate(credData);
+        // Create credential via N8N API
+        const credentialData = createCredentialPayload(credData);
         
-        // Generate JSON in CORRECT N8N CLI format (array of credentials)
-        const jsonContent = generateCredentialJSON([credentialTemplate]);
-
-        console.log('📝 Generated credential template:', {
-          id: credentialTemplate.id,
-          name: credentialTemplate.name,
-          type: credentialTemplate.type
+        console.log('📝 Credential payload created:', {
+          name: credentialData.name,
+          type: credentialData.type
         });
 
-        // Execute n8n CLI import
-        const importResult = await executeN8NImport(jsonContent, credData);
+        // Create credential via API
+        const importResult = await createN8NCredential(authToken, credentialData);
 
         if (importResult.success) {
           // Update database with success status
@@ -111,7 +104,7 @@ async function main() {
             credData.token_source,
             true,
             importResult.credentialId,
-            'Credentials injected successfully via Northflank job (flag-based)',
+            'Credentials injected successfully via N8N API (flag-based)',
             importResult.details
           );
 
@@ -119,12 +112,12 @@ async function main() {
             user_id: credData.user_id,
             provider: credData.provider,
             credentialId: importResult.credentialId,
-            method: 'flag_based_northflank_cli'
+            method: 'flag_based_n8n_api'
           });
 
           successCount++;
         } else {
-          throw new Error(importResult.message || 'Import failed');
+          throw new Error(importResult.message || 'API request failed');
         }
 
       } catch (error) {
@@ -150,7 +143,7 @@ async function main() {
       total: pendingCredentials.length,
       success: successCount,
       errors: errorCount,
-      method: 'flag_based_processing'
+      method: 'n8n_api_processing'
     });
 
     if (errorCount === 0) {
@@ -211,8 +204,7 @@ async function fetchPendingCredentials(supabase) {
         refresh_token: row.refresh_token || '',
         client_id: row.client_id,
         client_secret: row.client_secret,
-        injection_requested_at: row.injection_requested_at,
-        n8n_encryption_key: CONFIG.N8N_ENCRYPTION_KEY
+        injection_requested_at: row.injection_requested_at
       });
     }
 
@@ -225,9 +217,50 @@ async function fetchPendingCredentials(supabase) {
   }
 }
 
-// Create n8n credential template
-function createCredentialTemplate(credData) {
-  const credentialId = crypto.randomUUID();
+// Authenticate with N8N API
+async function authenticateN8N() {
+  try {
+    const loginUrl = `${CONFIG.N8N_URL}/api/v1/login`;
+    
+    console.log('🔐 Attempting N8N login:', {
+      url: loginUrl,
+      email: CONFIG.N8N_USER_EMAIL
+    });
+
+    const response = await fetch(loginUrl, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'Accept': 'application/json'
+      },
+      body: JSON.stringify({
+        email: CONFIG.N8N_USER_EMAIL,
+        password: CONFIG.N8N_USER_PASSWORD
+      })
+    });
+
+    if (!response.ok) {
+      const errorText = await response.text();
+      throw new Error(`N8N authentication failed: ${response.status} - ${errorText}`);
+    }
+
+    const authData = await response.json();
+    
+    if (!authData.data || !authData.data.token) {
+      throw new Error('No authentication token received from N8N');
+    }
+
+    console.log('✅ Authentication token received');
+    return authData.data.token;
+
+  } catch (error) {
+    console.error('❌ N8N authentication error:', error);
+    throw new Error(`Failed to authenticate with N8N: ${error.message}`);
+  }
+}
+
+// Create credential payload for N8N API
+function createCredentialPayload(credData) {
   const timestamp = new Date().toISOString().slice(0, 16).replace('T', ' ');
 
   const credentialTypes = {
@@ -243,9 +276,8 @@ function createCredentialTemplate(credData) {
     throw new Error(`Unsupported provider: ${credData.provider}`);
   }
 
-  // FIXED: Return structure that matches N8N CLI export format
+  // N8N API expects this exact structure
   return {
-    id: credentialId,
     name: `${credData.provider.charAt(0).toUpperCase() + credData.provider.slice(1)} OAuth2 - ${timestamp}`,
     type: credentialType,
     data: {
@@ -259,110 +291,70 @@ function createCredentialTemplate(credData) {
   };
 }
 
-// FIXED: Generate n8n import JSON - now returns ARRAY format directly
-function generateCredentialJSON(credentials) {
-  // N8N CLI expects credentials as a direct array, not wrapped in an object
-  return JSON.stringify(credentials, null, 2);
-}
-
-// Execute n8n CLI import
-async function executeN8NImport(jsonContent, credData) {
-  const tempFileName = `credentials-${Date.now()}-${credData.user_id.slice(0, 8)}.json`;
-  const tempFilePath = `/tmp/${tempFileName}`;
-
+// Create credential via N8N API
+async function createN8NCredential(authToken, credentialData) {
   try {
-    console.log('📝 Writing credential file:', tempFileName);
-    console.log('📄 JSON content preview:', jsonContent.substring(0, 300) + '...');
+    const createUrl = `${CONFIG.N8N_URL}/api/v1/credentials`;
     
-    await fs.writeFile(tempFilePath, jsonContent);
-
-    // Set up environment for n8n CLI
-    const env = {
-      ...process.env,
-      N8N_ENCRYPTION_KEY: CONFIG.N8N_ENCRYPTION_KEY,
-      N8N_DATABASE_TYPE: 'postgresdb',
-      DB_TYPE: 'postgresdb',
-      DB_POSTGRESDB_HOST: process.env.DB_POSTGRESDB_HOST,
-      DB_POSTGRESDB_PORT: process.env.DB_POSTGRESDB_PORT,
-      DB_POSTGRESDB_DATABASE: process.env.DB_POSTGRESDB_DATABASE,
-      DB_POSTGRESDB_USER: process.env.DB_POSTGRESDB_USER,
-      DB_POSTGRESDB_PASSWORD: process.env.DB_POSTGRESDB_PASSWORD,
-      N8N_LOG_LEVEL: 'error',
-      N8N_USER_MANAGEMENT_DISABLED: 'true'
-    };
-
-    console.log('🔧 Environment configured:', {
-      hasEncryptionKey: !!env.N8N_ENCRYPTION_KEY,
-      hasDbConfig: !!(env.DB_POSTGRESDB_HOST && env.DB_POSTGRESDB_PASSWORD),
-      dbType: env.N8N_DATABASE_TYPE
+    console.log('📡 Creating credential via N8N API:', {
+      url: createUrl,
+      type: credentialData.type,
+      name: credentialData.name
     });
 
-    // Execute n8n import command
-    const command = `n8n import:credentials --input=${tempFilePath}`;
-    console.log(`🚀 Executing: ${command}`);
-
-    const { stdout, stderr } = await execAsync(command, {
-      env,
-      timeout: 120000, // 2 minutes timeout
-      cwd: '/tmp'
+    const response = await fetch(createUrl, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'Accept': 'application/json',
+        'Cookie': `n8n-auth=${authToken}`
+      },
+      body: JSON.stringify(credentialData)
     });
 
-    console.log('📤 N8N CLI output:', stdout);
-    if (stderr) {
-      console.log('⚠️ N8N CLI stderr:', stderr);
+    if (!response.ok) {
+      const errorText = await response.text();
+      console.error('❌ N8N API error response:', {
+        status: response.status,
+        statusText: response.statusText,
+        body: errorText
+      });
+      throw new Error(`N8N API request failed: ${response.status} - ${errorText}`);
     }
 
-    // Check for success indicators
-    const successIndicators = [
-      'Successfully imported',
-      'imported',
-      'credential',
-      'Saved credential'
-    ];
+    const result = await response.json();
+    
+    console.log('✅ N8N API response:', {
+      hasData: !!result.data,
+      credentialId: result.data?.id
+    });
 
-    const isSuccess = successIndicators.some(indicator => 
-      stdout.toLowerCase().includes(indicator.toLowerCase())
-    );
-
-    if (isSuccess) {
-      const credentialId = JSON.parse(jsonContent)[0].id;
-      
-      return {
-        success: true,
-        credentialId: credentialId,
-        message: 'Credentials imported successfully via N8N CLI (flag-based)',
-        details: {
-          method: 'flag_based_northflank_n8n_cli',
-          output: stdout.substring(0, 500), // Limit output size
-          provider: credData.provider,
-          tokenSource: credData.token_source,
-          user_id: credData.user_id
-        }
-      };
-    } else {
-      throw new Error(`Import failed - no success indicators found in output: ${stdout}`);
+    if (!result.data || !result.data.id) {
+      throw new Error('No credential ID returned from N8N API');
     }
 
-  } catch (error) {
-    console.error('❌ N8N CLI execution failed:', error);
     return {
-      success: false,
-      message: error.message || 'N8N CLI execution failed',
+      success: true,
+      credentialId: result.data.id,
+      message: 'Credential created successfully via N8N API',
       details: {
-        error_type: 'cli_execution_error',
-        timestamp: new Date().toISOString(),
-        user_id: credData.user_id,
-        provider: credData.provider
+        method: 'n8n_api_direct',
+        credentialName: result.data.name,
+        credentialType: result.data.type,
+        timestamp: new Date().toISOString()
       }
     };
-  } finally {
-    // Cleanup temporary file
-    try {
-      await fs.unlink(tempFilePath);
-      console.log('🧹 Cleaned up temporary file:', tempFileName);
-    } catch (cleanupError) {
-      console.warn('⚠️ Failed to cleanup temporary file:', cleanupError.message);
-    }
+
+  } catch (error) {
+    console.error('❌ N8N API request failed:', error);
+    return {
+      success: false,
+      message: error.message || 'N8N API request failed',
+      details: {
+        error_type: 'api_request_error',
+        timestamp: new Date().toISOString()
+      }
+    };
   }
 }
 
@@ -376,13 +368,13 @@ async function updateCredentialStatus(supabase, userId, provider, tokenSource, s
       injection_attempted_at: new Date().toISOString(),
       injection_requested: false, // Reset flag after processing
       additional_data: JSON.stringify({
-        injection_method: 'flag_based_northflank_n8n_cli',
+        injection_method: 'flag_based_n8n_api',
         success: success,
         error: success ? null : message,
         details: details || {},
         timestamp: new Date().toISOString(),
         platform: 'northflank',
-        version: '4.0'
+        version: '5.0'
       }),
       updated_at: new Date().toISOString()
     };
