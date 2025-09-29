@@ -89,6 +89,8 @@ async function main() {
         
         // Create credential template
         const credentialTemplate = createCredentialTemplate(credData);
+        
+        // Generate JSON in CORRECT N8N CLI format (array of credentials)
         const jsonContent = generateCredentialJSON([credentialTemplate]);
 
         console.log('📝 Generated credential template:', {
@@ -241,6 +243,7 @@ function createCredentialTemplate(credData) {
     throw new Error(`Unsupported provider: ${credData.provider}`);
   }
 
+  // FIXED: Return structure that matches N8N CLI export format
   return {
     id: credentialId,
     name: `${credData.provider.charAt(0).toUpperCase() + credData.provider.slice(1)} OAuth2 - ${timestamp}`,
@@ -252,19 +255,14 @@ function createCredentialTemplate(credData) {
       refreshToken: credData.refresh_token,
       tokenType: 'Bearer',
       grantType: 'authorizationCode'
-    },
-    createdAt: new Date().toISOString(),
-    updatedAt: new Date().toISOString()
+    }
   };
 }
 
-// Generate n8n import JSON
+// FIXED: Generate n8n import JSON - now returns ARRAY format directly
 function generateCredentialJSON(credentials) {
-  return JSON.stringify({
-    version: "1.0.0",
-    credentials: credentials,
-    workflows: []
-  }, null, 2);
+  // N8N CLI expects credentials as a direct array, not wrapped in an object
+  return JSON.stringify(credentials, null, 2);
 }
 
 // Execute n8n CLI import
@@ -274,6 +272,8 @@ async function executeN8NImport(jsonContent, credData) {
 
   try {
     console.log('📝 Writing credential file:', tempFileName);
+    console.log('📄 JSON content preview:', jsonContent.substring(0, 300) + '...');
+    
     await fs.writeFile(tempFilePath, jsonContent);
 
     // Set up environment for n8n CLI
@@ -325,7 +325,7 @@ async function executeN8NImport(jsonContent, credData) {
     );
 
     if (isSuccess) {
-      const credentialId = JSON.parse(jsonContent).credentials[0].id;
+      const credentialId = JSON.parse(jsonContent)[0].id;
       
       return {
         success: true,
