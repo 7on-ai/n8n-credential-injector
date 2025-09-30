@@ -14,14 +14,15 @@ RUN apk add --no-cache \
 # Set working directory
 WORKDIR /app
 
-# Create package.json for the injector service
+# Create package.json with pg dependency
 RUN echo '{ \
   "name": "n8n-credential-injector", \
-  "version": "3.0.0", \
+  "version": "7.0.0", \
   "type": "module", \
   "main": "injector.js", \
   "dependencies": { \
-    "@supabase/supabase-js": "^2.38.0" \
+    "@supabase/supabase-js": "^2.38.0", \
+    "pg": "^8.11.3" \
   } \
 }' > package.json
 
