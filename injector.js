@@ -375,7 +375,7 @@ async function insertCredentialToDatabase(pgClient, n8nCrypto, credData) {
     const credentialId = crypto.randomUUID();
 
     const credentialTypes = {
-      google: 'googleOAuth2Api',
+      google: 'googleCalendarOAuth2Api',
       spotify: 'spotifyOAuth2Api',
       github: 'githubOAuth2Api',
       discord: 'discordOAuth2Api',
@@ -407,18 +407,19 @@ async function insertCredentialToDatabase(pgClient, n8nCrypto, credData) {
 
     const encryptedData = n8nCrypto.encrypt(credentialDataObject);
 
-    const credentialName = `${credData.provider.charAt(0).toUpperCase() + credData.provider.slice(1)} OAuth2 - ${timestamp.toISOString().slice(0, 16).replace('T', ' ')}`;
+    const credentialName = `${credData.provider.charAt(0).toUpperCase() + credData.provider.slice(1)} Calendar OAuth2 - ${timestamp.toISOString().slice(0, 16).replace('T', ' ')}`;
 
-    // Insert query
+    // Insert credential with isManaged=false
     const insertQuery = `
       INSERT INTO credentials_entity (
         id,
         name,
         type,
         data,
+        "isManaged",
         "createdAt",
         "updatedAt"
-      ) VALUES ($1, $2, $3, $4, $5, $6)
+      ) VALUES ($1, $2, $3, $4, $5, $6, $7)
       RETURNING id, name, type
     `;
 
@@ -427,19 +428,54 @@ async function insertCredentialToDatabase(pgClient, n8nCrypto, credData) {
       credentialName,
       credentialType,
       encryptedData,
+      false,  // isManaged
       timestamp,
       timestamp
     ];
 
-    console.log('  💾 Inserting into database...');
+    console.log('  💾 Inserting credential into credentials_entity...');
     const result = await pgClient.query(insertQuery, values);
 
     if (result.rowCount > 0) {
-      console.log('  ✅ Database insert successful');
+      console.log('  ✅ Credential inserted into credentials_entity');
+      
+      // Now insert into shared_credentials to link with project
+      // Get the home project ID (first project in the instance)
+      const projectQuery = await pgClient.query(`
+        SELECT id FROM project ORDER BY "createdAt" ASC LIMIT 1
+      `);
+      
+      if (projectQuery.rows.length > 0) {
+        const projectId = projectQuery.rows[0].id;
+        console.log('  🔗 Linking credential to project:', projectId);
+        
+        const sharedQuery = `
+          INSERT INTO shared_credentials (
+            "credentialsId",
+            "projectId",
+            role,
+            "createdAt",
+            "updatedAt"
+          ) VALUES ($1, $2, $3, $4, $5)
+        `;
+        
+        await pgClient.query(sharedQuery, [
+          credentialId,
+          projectId,
+          'credential:owner',
+          timestamp,
+          timestamp
+        ]);
+        
+        console.log('  ✅ Credential linked to project successfully');
+      } else {
+        console.log('  ⚠️ No project found - credential created but not linked');
+      }
+      
       return {
         success: true,
         credentialId: credentialId,
-        message: 'Credential inserted successfully',
+        message: 'Credential inserted and linked successfully',
         details: {
           method: 'direct_database_insert',
           credentialName: credentialName,
