@@ -1,7 +1,7 @@
 {
   "name": "n8n-credential-injector",
-  "version": "3.0.0",
-  "description": "N8N Credential Injector Service for Northflank",
+  "version": "6.0.0",
+  "description": "N8N Credential Injector Service - Direct Database Insert Method",
   "main": "injector.js",
   "type": "module",
   "scripts": {
@@ -9,12 +9,13 @@
     "dev": "node --watch injector.js"
   },
   "dependencies": {
-    "@supabase/supabase-js": "^2.38.0"
+    "@supabase/supabase-js": "^2.38.0",
+    "pg": "^8.11.3"
   },
   "engines": {
     "node": ">=20.19"
   },
-  "keywords": ["n8n", "cli", "northflank", "credentials", "injector"],
+  "keywords": ["n8n", "database", "northflank", "credentials", "injector"],
   "author": "",
   "license": "MIT"
 }
